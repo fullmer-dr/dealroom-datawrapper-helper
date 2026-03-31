@@ -1,16 +1,17 @@
 import streamlit as st
 from datawrapper_api import (
     update_chart_metadata,
-    get_chart_ids_in_folder,
+    get_chart_ids_in_folder_recursive,
     republish_charts,
     fetch_chart_metadata_fields,
     get_chart_name,
     get_folder_name,
     get_chart_type,
     get_relevant_fields,
+    get_line_customization_strings,
     bulk_create_charts,
-    fetch_data,  # Add this import
-    BASE_URL     # Add this import
+    fetch_data,
+    BASE_URL,
 )
 from io import StringIO
 import pandas as pd
@@ -29,15 +30,11 @@ def display_chart_and_folder_names(chart_ids, folder_ids):
             st.write(f"- {name}")
 
 def get_all_chart_ids(chart_ids_input, folder_ids_input):
-    # Parse chart IDs input
     chart_ids = [chart_id.strip() for chart_id in chart_ids_input.split(',') if chart_id.strip()]
-    # Parse folder IDs input
     folder_ids = [folder_id.strip() for folder_id in folder_ids_input.split(',') if folder_id.strip()]
-    # Initialize all_chart_ids with direct chart IDs
-    all_chart_ids = chart_ids
-    # Retrieve chart IDs from each folder
+    all_chart_ids = list(chart_ids)
     for folder_id in folder_ids:
-        folder_chart_ids = get_chart_ids_in_folder(folder_id)
+        folder_chart_ids = get_chart_ids_in_folder_recursive(folder_id)
         all_chart_ids.extend(folder_chart_ids)
     return all_chart_ids
 
@@ -79,6 +76,30 @@ def prepare_metadata_update(metadata_inputs):
             except Exception as e:
                 st.error(f"Error parsing column headers: {e}")
                 st.error("Format should be: old_column_name:new_name, e.g., 'VC Investment:2024 Value'")
+                return None
+        elif key == 'visualize.color-category.map':
+            try:
+                if value:
+                    color_map = {}
+                    for pair in value.split(','):
+                        series, color = pair.strip().rsplit(':', 1)
+                        color_map[series.strip()] = color.strip()
+                    value = color_map
+            except Exception as e:
+                st.error(f"Error parsing line colors: {e}")
+                st.error("Format should be: Series A:#ff0000, Series B:#0000ff")
+                return None
+        elif key == 'visualize.lines':
+            try:
+                if value:
+                    lines = {}
+                    for pair in value.split(','):
+                        series, width = pair.strip().rsplit(':', 1)
+                        lines[series.strip()] = {"width": width.strip()}
+                    value = lines
+            except Exception as e:
+                st.error(f"Error parsing line widths: {e}")
+                st.error("Format should be: Series A:style1, Series B:style2")
                 return None
             
         # Set the value at the final level
@@ -198,7 +219,7 @@ def main():
                     sample_chart_id = valid_charts[0]
                 elif valid_folders:
                     for folder_id in valid_folders:
-                        folder_chart_ids = get_chart_ids_in_folder(folder_id)
+                        folder_chart_ids = get_chart_ids_in_folder_recursive(folder_id)
                         if folder_chart_ids:
                             sample_chart_id = folder_chart_ids[0]
                             break
@@ -232,13 +253,25 @@ def main():
                     # Show visualization type
                     st.write(f"Visualization Type: {chart_type}")
 
+                    # Copy from chart (line charts only)
+                    if chart_type == 'd3-lines':
+                        with st.expander("Copy line settings from another chart"):
+                            copy_source_id = st.text_input("Source Chart ID", key="copy_source_chart_id")
+                            if st.button("Copy Settings") and copy_source_id:
+                                colors_str, widths_str = get_line_customization_strings(copy_source_id)
+                                if colors_str is not None:
+                                    st.session_state['prefill_visualize.color-category.map'] = colors_str
+                                    st.session_state['prefill_visualize.lines'] = widths_str
+                                    st.success("Settings copied! Select the Customize Lines fields to see them pre-filled.")
+                                    st.rerun()
+
                     # Single multiselect for all available fields
                     selected_field_displays = st.multiselect(
                         "Select fields to edit",
                         options=list(field_options.keys()),
                         default=st.session_state.selected_fields
                     )
-                    
+
                     # Update session state with the selected fields
                     st.session_state.selected_fields = selected_field_displays
 
@@ -248,7 +281,12 @@ def main():
                         field_key = field_options[display_key]
                         # Remove the category from the display name for the input field label
                         display_name = display_key.split(" (")[0]
-                        metadata_inputs[field_key] = st.text_input(f"Enter value for {display_name}")
+                        prefill = st.session_state.get(f'prefill_{field_key}', '')
+                        metadata_inputs[field_key] = st.text_input(
+                            f"Enter value for {display_name}",
+                            value=prefill,
+                            key=f"input_{field_key}"
+                        )
 
                     # Identify which fields are empty (i.e. slated for deletion)
                     empty_fields = [key for key, value in metadata_inputs.items() if value == ""]

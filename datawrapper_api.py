@@ -1,7 +1,15 @@
 import requests
 import streamlit as st
 import pandas as pd
+import time
 from typing import Dict, List, Optional
+
+# Rate limiting and retry configuration
+REQUEST_DELAY = 0.3    # seconds between individual requests
+BATCH_SIZE = 10        # charts per batch before a longer pause
+BATCH_DELAY = 2        # seconds between batches
+MAX_RETRIES = 3        # retry attempts per request
+REQUEST_TIMEOUT = 30   # seconds before a single request times out
 
 # Access the API key from Streamlit secrets
 try:
@@ -20,13 +28,13 @@ except Exception as e:
 def fetch_data(url: str) -> Optional[Dict]:
     """Base function for making GET requests to the Datawrapper API."""
     try:
-        response = requests.get(url, headers=HEADERS)
+        response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
         st.error(f"Request failed for URL: {url}")
         st.error(f"Error: {str(e)}")
-        if hasattr(e.response, 'text'):
+        if hasattr(e, 'response') and e.response is not None:
             st.error(f"Response: {e.response.text}")
         return None
 
@@ -51,14 +59,14 @@ def make_request(method: str, url: str, json: Optional[Dict] = None) -> Optional
         # Clean JSON data before sending
         if json:
             json = clean_json_data(json)
-        
-        response = requests.request(method, url, headers=HEADERS, json=json)
+
+        response = requests.request(method, url, headers=HEADERS, json=json, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         return response.json() if response.text else None
     except requests.exceptions.RequestException as e:
         st.error(f"{method} request failed for URL: {url}")
         st.error(f"Error: {str(e)}")
-        if hasattr(e.response, 'text'):
+        if hasattr(e, 'response') and e.response is not None:
             st.error(f"Response: {e.response.text}")
         return None
 
@@ -90,14 +98,57 @@ def fetch_chart_metadata_fields(chart_id):
     
     return high_level_properties, fields_by_property, grouped_high_level_properties
 
-def get_chart_ids_in_folder(folder_id):
-    # Use the correct URL structure for fetching charts in a folder
+def get_chart_ids_in_folder(folder_id: str) -> List[str]:
+    """Get all chart IDs directly inside a folder (non-recursive)."""
     url = f"{BASE_URL}charts?folderId={folder_id}"
     folder_data = fetch_data(url)
     if folder_data:
-        # Extract chart IDs from the response
         return [chart['id'] for chart in folder_data.get('list', [])]
     return []
+
+def get_all_subfolders(folder_id: str) -> List[str]:
+    """Recursively get all subfolder IDs under a given folder.
+
+    Tries two strategies:
+    1. GET /folders/{id} — if the response includes a nested `folders` list.
+    2. GET /folders       — flat list filtered by `parentId` (fallback).
+    """
+    folder_data = fetch_data(f"{BASE_URL}folders/{folder_id}")
+    if folder_data:
+        nested = folder_data.get('folders', [])
+        if nested:
+            result = []
+            for subfolder in nested:
+                sub_id = str(subfolder.get('id', ''))
+                if sub_id:
+                    result.append(sub_id)
+                    result.extend(get_all_subfolders(sub_id))
+            return result
+
+    # Fallback: fetch all folders and filter by parentId
+    all_folders_data = fetch_data(f"{BASE_URL}folders")
+    if not all_folders_data:
+        return []
+
+    folder_list = all_folders_data.get('list', [])
+
+    def collect_children(parent_id: str) -> List[str]:
+        children = []
+        for folder in folder_list:
+            if str(folder.get('parentId', '')) == str(parent_id):
+                child_id = str(folder['id'])
+                children.append(child_id)
+                children.extend(collect_children(child_id))
+        return children
+
+    return collect_children(str(folder_id))
+
+def get_chart_ids_in_folder_recursive(folder_id: str) -> List[str]:
+    """Get all chart IDs from a folder and all its subfolders."""
+    all_chart_ids = get_chart_ids_in_folder(folder_id)
+    for subfolder_id in get_all_subfolders(folder_id):
+        all_chart_ids.extend(get_chart_ids_in_folder(subfolder_id))
+    return all_chart_ids
 
 def get_chart_name(chart_id):
     chart_data = fetch_data(f"{BASE_URL}charts/{chart_id}")
@@ -111,30 +162,68 @@ def update_chart_metadata(chart_ids, metadata):
     total_charts = len(chart_ids)
     progress_bar = st.progress(0)
     success_count = 0
+    failed_count = 0
     updated_chart_titles = []
-
-    # Initialize a placeholder for the progress text
     progress_text = st.empty()
+    status_text = st.empty()
 
     for index, chart_id in enumerate(chart_ids):
-        st.write(f"Updating chart ID {chart_id} with metadata: {metadata}")
-        response = requests.patch(f"{BASE_URL}charts/{chart_id}", headers=HEADERS, json={"metadata": metadata})
+        # Delay between requests to avoid rate limiting
+        if index > 0:
+            time.sleep(REQUEST_DELAY)
 
+        # Extra pause between batches
+        if index > 0 and index % BATCH_SIZE == 0:
+            status_text.text(f"Pausing between batches ({index}/{total_charts} done)...")
+            time.sleep(BATCH_DELAY)
 
-        if response.status_code == 200:
+        progress_text.text(f"Updating chart {index + 1} of {total_charts} (ID: {chart_id})")
+
+        response = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = requests.patch(
+                    f"{BASE_URL}charts/{chart_id}",
+                    headers=HEADERS,
+                    json=clean_json_data({"metadata": metadata}),
+                    timeout=REQUEST_TIMEOUT,
+                )
+                if resp.status_code == 429:
+                    wait_time = 5 * (2 ** attempt)
+                    status_text.text(f"Rate limited. Waiting {wait_time}s before retrying...")
+                    time.sleep(wait_time)
+                    continue
+                response = resp
+                break
+            except requests.exceptions.Timeout:
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                status_text.text(f"Chart {chart_id} timed out, moving on.")
+                break
+            except requests.exceptions.RequestException as e:
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                st.error(f"Request error for chart {chart_id}: {str(e)}")
+                break
+
+        if response is not None and response.status_code == 200:
             success_count += 1
-            chart_data = response.json()
-            updated_chart_titles.append(chart_data.get('title', 'Unknown Title'))
-            st.write(f"Successfully updated chart {chart_id}")
+            updated_chart_titles.append(response.json().get('title', 'Unknown Title'))
         else:
-            st.error(f"Failed to update chart {chart_id}. Status code: {response.status_code}")
-            st.error(response.text)
-        
-        # Update the progress bar and text
-        progress_bar.progress((index + 1) / total_charts)
-        progress_text.text(f"Processing chart {index + 1} of {total_charts}")
+            failed_count += 1
+            if response is not None:
+                st.error(f"Failed to update chart {chart_id}. Status: {response.status_code}")
+            else:
+                st.warning(f"Skipped chart {chart_id} after {MAX_RETRIES} failed attempts.")
 
+        progress_bar.progress((index + 1) / total_charts)
+
+    status_text.empty()
     st.success(f"Update completed: {success_count}/{total_charts} charts updated successfully.")
+    if failed_count > 0:
+        st.warning(f"{failed_count} charts failed to update.")
     if updated_chart_titles:
         st.write("Updated Charts:")
         for title in updated_chart_titles:
@@ -144,26 +233,65 @@ def republish_charts(chart_ids, chart_titles):
     total_charts = len(chart_ids)
     progress_bar = st.progress(0)
     success_count = 0
+    failed_count = 0
     republished_chart_titles = []
-
-    # Initialize a placeholder for the progress text
     progress_text = st.empty()
+    status_text = st.empty()
 
     for index, chart_id in enumerate(chart_ids):
-        response = requests.post(f"{BASE_URL}charts/{chart_id}/publish", headers=HEADERS)
-        
-        if response.status_code == 200:
+        if index > 0:
+            time.sleep(REQUEST_DELAY)
+
+        if index > 0 and index % BATCH_SIZE == 0:
+            status_text.text(f"Pausing between batches ({index}/{total_charts} done)...")
+            time.sleep(BATCH_DELAY)
+
+        progress_text.text(f"Republishing chart {index + 1} of {total_charts} (ID: {chart_id})")
+
+        response = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = requests.post(
+                    f"{BASE_URL}charts/{chart_id}/publish",
+                    headers=HEADERS,
+                    timeout=REQUEST_TIMEOUT,
+                )
+                if resp.status_code == 429:
+                    wait_time = 5 * (2 ** attempt)
+                    status_text.text(f"Rate limited. Waiting {wait_time}s before retrying...")
+                    time.sleep(wait_time)
+                    continue
+                response = resp
+                break
+            except requests.exceptions.Timeout:
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                status_text.text(f"Chart {chart_id} timed out, moving on.")
+                break
+            except requests.exceptions.RequestException as e:
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                st.error(f"Request error for chart {chart_id}: {str(e)}")
+                break
+
+        if response is not None and response.status_code == 200:
             success_count += 1
             republished_chart_titles.append(chart_titles.get(chart_id, 'Unknown Title'))
         else:
-            st.error(f"Failed to republish chart {chart_id}. Status code: {response.status_code}")
-            st.error(response.text)
-        
-        # Update the progress bar and text
-        progress_bar.progress((index + 1) / total_charts)
-        progress_text.text(f"Processing chart {index + 1} of {total_charts}")
+            failed_count += 1
+            if response is not None:
+                st.error(f"Failed to republish chart {chart_id}. Status: {response.status_code}")
+            else:
+                st.warning(f"Skipped chart {chart_id} after {MAX_RETRIES} failed attempts.")
 
+        progress_bar.progress((index + 1) / total_charts)
+
+    status_text.empty()
     st.success(f"Republish completed: {success_count}/{total_charts} charts republished successfully.")
+    if failed_count > 0:
+        st.warning(f"{failed_count} charts failed to republish.")
     if republished_chart_titles:
         st.write("Republished Chart Titles:")
         for title in republished_chart_titles:
@@ -173,6 +301,31 @@ def get_chart_type(chart_id):
     """Get the visualization type of a chart."""
     chart_data = fetch_data(f"{BASE_URL}charts/{chart_id}")
     return chart_data.get('type') if chart_data else None
+
+def get_line_customization_strings(chart_id):
+    """Fetch a chart's line colors and widths formatted as UI input strings.
+
+    Returns (colors_str, widths_str) where:
+      colors_str: "Series A:#ff0000, Series B:#0000ff"
+      widths_str: "Series A:style1, Series B:style2"
+    """
+    chart_data = fetch_data(f"{BASE_URL}charts/{chart_id}")
+    if not chart_data:
+        return None, None
+
+    visualize = chart_data.get('metadata', {}).get('visualize', {})
+
+    color_map = visualize.get('color-category', {}).get('map', {})
+    colors_str = ', '.join(f"{s}:{c}" for s, c in color_map.items()) if color_map else ''
+
+    lines = visualize.get('lines', {})
+    widths_str = ', '.join(
+        f"{s}:{props['width']}"
+        for s, props in lines.items()
+        if isinstance(props, dict) and 'width' in props
+    ) if lines else ''
+
+    return colors_str, widths_str
 
 def get_relevant_fields(chart_type):
     """Get relevant fields based on chart type."""
@@ -202,6 +355,12 @@ def get_relevant_fields(chart_type):
         }
         # Add number format only for charts
         fields['Text']['describe.number-format'] = 'Number Format Style'
+
+    if chart_type == 'd3-lines':
+        fields['Customize Lines'] = {
+            'visualize.color-category.map': 'Line Colors (e.g., "Series A:#ff0000, Series B:#0000ff")',
+            'visualize.lines': 'Line Widths (e.g., "Series A:style1, Series B:style2" — style1=thin, style2=thick)',
+        }
     
     # Add table-specific fields
     elif chart_type == 'tables':  # Changed from 'd3-tables' to 'tables'
